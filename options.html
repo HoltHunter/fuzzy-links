@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fuzzy Links Settings</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    body { margin: 0; background: #111418; color: #e6edf3; }
+    main { width: min(680px, calc(100% - 40px)); margin: 64px auto; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    .sub { color: #8b949e; margin-bottom: 32px; line-height: 1.55; }
+    .card { border: 1px solid #30363d; background: #161b22; border-radius: 12px; padding: 22px; }
+    label { display: block; font-weight: 700; margin-bottom: 9px; }
+    .row { display: flex; gap: 10px; align-items: center; }
+    input { flex: 1; min-width: 0; padding: 11px 12px; border-radius: 8px; border: 1px solid #3d444d; background: #0d1117; color: #f0f6fc; font: inherit; outline: none; }
+    input:focus { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,.16); }
+    button { padding: 11px 16px; border: 0; border-radius: 8px; background: #238636; color: #fff; font: inherit; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #30363d; }
+    .hint { margin-top: 10px; color: #8b949e; font-size: 12px; line-height: 1.5; }
+    .status { margin-top: 14px; min-height: 18px; font-size: 12px; color: #3fb950; }
+    kbd { border: 1px solid #3d444d; border-bottom-width: 2px; background: #21262d; padding: 2px 6px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fuzzy Links Settings</h1>
+    <div class="sub">Configure the keyboard shortcut used to open Fuzzy Links and toggle SEARCH/NAV mode.</div>
+    <div class="card">
+      <label for="shortcut">Activation shortcut</label>
+      <div class="row">
+        <input id="shortcut" readonly aria-label="Activation shortcut">
+        <button id="reset" class="secondary" type="button">Reset</button>
+        <button id="save" type="button">Save</button>
+      </div>
+      <div class="hint">Click the field, then press the shortcut you want. A modifier such as <kbd>Ctrl</kbd>, <kbd>Alt</kbd>, or <kbd>Shift</kbd> is required. Default: <kbd>Ctrl+Space</kbd>.</div>
+      <div id="status" class="status" role="status"></div>
+    </div>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

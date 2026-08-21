@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Fuzzy Links",
+  "version": "2.1.3",
+  "description": "Keyboard-first fuzzy query and spatial navigation for Chromium browsers, with persistent sessions and context-aware scrolling.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}
