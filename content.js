@@ -31,6 +31,24 @@
     selectedLabel: null,
     hint: null,
     activationShortcut: "Ctrl+Space",
+    normalSequence: "",
+    normalSequenceTimer: null,
+    textMode: "insert",
+    textNormalEscArmed: false,
+    textVisualAnchor: null,
+    textOperator: "",
+    textOperatorTimer: null,
+    textPendingReplace: false,
+    textRegister: "",
+    textRegisterLinewise: false,
+    textModeHost: null,
+    textModeBadge: null,
+    hintMode: false,
+    hintHost: null,
+    hintShadow: null,
+    hintItems: [],
+    hintBuffer: "",
+    lastShiftDownAt: 0,
   };
 
   const MAX_RESULTS = 8;
@@ -40,6 +58,10 @@
   const HOVER_RESCAN_DELAY_MS = 120;
   const ACTIVATION_RESCAN_DELAY_MS = 80;
   const ACTIVATION_SETTLE_RESCAN_DELAY_MS = 260;
+  const NORMAL_SEQUENCE_TIMEOUT_MS = 650;
+  const TEXT_OPERATOR_TIMEOUT_MS = 900;
+  const DOUBLE_SHIFT_MS = 350;
+  const HINT_ALPHABET = "asdfghjklqwertyuiopzxcvbnm";
   const SESSION_STORAGE_KEY = "__fuzzyLinksSessionV212";
 
   function normalizeShortcutKey(key) {
@@ -89,6 +111,1117 @@
 
   function normalize(text) {
     return (text || "").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function isPageTextEntry(el) {
+    if (!(el instanceof Element)) return false;
+    if (state.input && el === state.input) return false;
+
+    if (el instanceof HTMLTextAreaElement) return !el.disabled && !el.readOnly;
+    if (el instanceof HTMLSelectElement) return !el.disabled;
+    if (el instanceof HTMLInputElement) {
+      const type = (el.type || "text").toLowerCase();
+      const nonTextTypes = new Set([
+        "button", "submit", "reset", "checkbox", "radio", "range",
+        "color", "file", "image", "hidden"
+      ]);
+      return !el.disabled && !el.readOnly && !nonTextTypes.has(type);
+    }
+
+    if (el.isContentEditable) return true;
+    return el.getAttribute?.("role") === "textbox";
+  }
+
+
+  function isPlainTextControl(el) {
+    if (el instanceof HTMLTextAreaElement) return !el.disabled && !el.readOnly;
+    if (!(el instanceof HTMLInputElement)) return false;
+    const type = (el.type || "text").toLowerCase();
+    return !el.disabled && !el.readOnly && [
+      "text", "search", "url", "tel", "email", "password"
+    ].includes(type);
+  }
+
+  function activePageTextEntry() {
+    const el = document.activeElement;
+    return isPageTextEntry(el) ? el : null;
+  }
+
+  function ensureTextModeBadge() {
+    if (state.textModeHost?.isConnected && state.textModeBadge) return;
+
+    const host = document.createElement("div");
+    host.id = "__fuzzy_links_text_mode_host";
+    host.style.position = "fixed";
+    host.style.right = "12px";
+    host.style.bottom = "12px";
+    host.style.zIndex = "2147483647";
+    host.style.pointerEvents = "none";
+
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { all: initial; }
+      #badge {
+        display: none;
+        box-sizing: border-box;
+        min-width: 96px;
+        padding: 6px 10px;
+        border: 1px solid rgba(255,255,255,.16);
+        border-radius: 7px;
+        background: rgba(22,24,29,.94);
+        box-shadow: 0 3px 14px rgba(0,0,0,.28);
+        color: #f1f3f4;
+        font: 700 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .06em;
+        text-align: center;
+        backdrop-filter: blur(5px);
+      }
+      #badge.insert { border-color: #3aa675; color: #8ee6bc; }
+      #badge.normal { border-color: #f1b82d; color: #ffd66e; }
+      #badge.visual { border-color: #a678e8; color: #cfb2ff; }
+      #badge.pending { border-color: #56a8e8; color: #9fd4ff; }
+    `;
+    const badge = document.createElement("div");
+    badge.id = "badge";
+    shadow.append(style, badge);
+    document.documentElement.appendChild(host);
+
+    state.textModeHost = host;
+    state.textModeBadge = badge;
+  }
+
+  function updateTextModeBadge() {
+    const el = activePageTextEntry();
+    ensureTextModeBadge();
+    if (!el) {
+      state.textModeBadge.style.display = "none";
+      return;
+    }
+
+    const pending = state.textPendingReplace ? "r…" : state.textOperator;
+    const label = pending
+      ? `TEXT NORMAL · ${pending}…`
+      : `TEXT ${state.textMode.toUpperCase()}`;
+
+    state.textModeBadge.textContent = label;
+    state.textModeBadge.className = pending ? "pending" : state.textMode;
+    state.textModeBadge.style.display = "block";
+  }
+
+  function clearTextOperator() {
+    clearTimeout(state.textOperatorTimer);
+    state.textOperatorTimer = null;
+    state.textOperator = "";
+    state.textPendingReplace = false;
+    updateTextModeBadge();
+  }
+
+  function armTextOperator(op) {
+    clearTextOperator();
+    state.textOperator = op;
+    state.textOperatorTimer = setTimeout(clearTextOperator, TEXT_OPERATOR_TIMEOUT_MS);
+    updateTextModeBadge();
+  }
+
+  function armTextReplace() {
+    clearTextOperator();
+    state.textPendingReplace = true;
+    state.textOperatorTimer = setTimeout(clearTextOperator, TEXT_OPERATOR_TIMEOUT_MS);
+    updateTextModeBadge();
+  }
+
+  function setTextMode(mode, el = activePageTextEntry()) {
+    state.textMode = mode;
+    state.textNormalEscArmed = false;
+    clearTextOperator();
+
+    if (mode === "visual" && isPlainTextControl(el)) {
+      state.textVisualAnchor = el.selectionStart ?? 0;
+    } else if (mode !== "visual") {
+      state.textVisualAnchor = null;
+    }
+
+    if (el) {
+      try { el.dataset.fuzzyLinksTextMode = mode; } catch (_) {}
+    }
+    updateTextModeBadge();
+  }
+
+  function resetTextMode(el) {
+    clearTextOperator();
+    if (el) {
+      try { delete el.dataset.fuzzyLinksTextMode; } catch (_) {}
+    }
+    state.textMode = "insert";
+    state.textNormalEscArmed = false;
+    state.textVisualAnchor = null;
+    updateTextModeBadge();
+  }
+
+  function emitInput(el, inputType = "insertText", data = null) {
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType,
+        data
+      }));
+    } catch (_) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  function clampCaret(el, pos) {
+    return Math.max(0, Math.min(pos, (el.value || "").length));
+  }
+
+  function caretPos(el) {
+    if (!isPlainTextControl(el)) return 0;
+    return (el.selectionDirection === "backward" ? el.selectionStart : el.selectionEnd) ?? 0;
+  }
+
+  function setCaret(el, pos, extendVisual = false) {
+    if (!isPlainTextControl(el)) return;
+    const p = clampCaret(el, pos);
+    if (extendVisual && state.textVisualAnchor != null) {
+      const a = clampCaret(el, state.textVisualAnchor);
+      el.setSelectionRange(Math.min(a, p), Math.max(a, p), p < a ? "backward" : "forward");
+    } else {
+      el.setSelectionRange(p, p);
+    }
+  }
+
+  function wordForwardIndex(value, pos) {
+    let i = Math.max(0, Math.min(pos, value.length));
+    if (i < value.length && /\w/.test(value[i])) {
+      while (i < value.length && /\w/.test(value[i])) i++;
+    }
+    while (i < value.length && !/\w/.test(value[i])) i++;
+    return i;
+  }
+
+  function wordEndIndex(value, pos) {
+    let i = Math.max(0, Math.min(pos, Math.max(0, value.length - 1)));
+    if (i < value.length && /\w/.test(value[i])) {
+      while (i + 1 < value.length && /\w/.test(value[i + 1])) i++;
+      return Math.min(value.length, i + 1);
+    }
+    while (i < value.length && !/\w/.test(value[i])) i++;
+    while (i + 1 < value.length && /\w/.test(value[i + 1])) i++;
+    return Math.min(value.length, i + 1);
+  }
+
+  function wordBackwardIndex(value, pos) {
+    if (!value.length) return 0;
+    let i = Math.max(0, Math.min(pos - 1, value.length - 1));
+    while (i > 0 && !/\w/.test(value[i])) i--;
+    while (i > 0 && /\w/.test(value[i - 1])) i--;
+    return i;
+  }
+
+  function currentLineRange(el, pos = caretPos(el), includeNewline = true) {
+    const value = el.value || "";
+    if (!(el instanceof HTMLTextAreaElement)) {
+      return { start: 0, end: value.length };
+    }
+
+    const start = value.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
+    let newline = value.indexOf("\n", pos);
+    if (newline < 0) newline = value.length;
+    let end = newline;
+
+    if (includeNewline && newline < value.length) end = newline + 1;
+    else if (includeNewline && start > 0 && newline === value.length) {
+      // For the final textarea line, include the preceding newline so dd does not
+      // leave an empty trailing line behind.
+      return { start: start - 1, end: value.length };
+    }
+    return { start, end };
+  }
+
+  function rangeForMotion(el, motion, pos = caretPos(el)) {
+    const value = el.value || "";
+    if (motion === "w") return { start: pos, end: wordForwardIndex(value, pos) };
+    if (motion === "e") return { start: pos, end: wordEndIndex(value, pos) };
+    if (motion === "$") return { start: pos, end: currentLineRange(el, pos, false).end };
+    if (motion === "0") return { start: currentLineRange(el, pos, false).start, end: pos };
+    if (motion === "b") return { start: wordBackwardIndex(value, pos), end: pos };
+    return null;
+  }
+
+  function replaceRange(el, start, end, replacement, inputType) {
+    start = clampCaret(el, start);
+    end = clampCaret(el, end);
+    if (end < start) [start, end] = [end, start];
+    el.setRangeText(replacement, start, end, "start");
+    emitInput(el, inputType, replacement || null);
+    return start;
+  }
+
+  function yankRange(el, start, end, linewise = false) {
+    const value = el.value || "";
+    start = clampCaret(el, start);
+    end = clampCaret(el, end);
+    if (end < start) [start, end] = [end, start];
+    state.textRegister = value.slice(start, end);
+    state.textRegisterLinewise = linewise;
+  }
+
+  function deleteRange(el, start, end, linewise = false) {
+    yankRange(el, start, end, linewise);
+    const newPos = replaceRange(el, start, end, "", "deleteContentForward");
+    setCaret(el, newPos);
+  }
+
+  function changeRange(el, start, end) {
+    deleteRange(el, start, end, false);
+    setTextMode("insert", el);
+  }
+
+  function pasteRegister(el, after) {
+    if (!state.textRegister) return;
+    const value = el.value || "";
+    let pos = caretPos(el);
+
+    if (state.textRegisterLinewise && el instanceof HTMLTextAreaElement) {
+      const line = currentLineRange(el, pos, false);
+      if (after) {
+        pos = line.end;
+        const prefix = pos < value.length ? "\n" : (value && !value.endsWith("\n") ? "\n" : "");
+        const text = prefix + state.textRegister.replace(/^\n/, "");
+        el.setRangeText(text, pos, pos, "end");
+      } else {
+        pos = line.start;
+        let text = state.textRegister;
+        if (text && !text.endsWith("\n")) text += "\n";
+        el.setRangeText(text, pos, pos, "start");
+      }
+    } else {
+      pos = after ? Math.min(value.length, pos + 1) : pos;
+      el.setRangeText(state.textRegister, pos, pos, "end");
+    }
+    emitInput(el, "insertFromPaste", state.textRegister);
+  }
+
+  function insertTextareaLine(el, below) {
+    if (!(el instanceof HTMLTextAreaElement)) return false;
+    const pos = caretPos(el);
+    const line = currentLineRange(el, pos, false);
+    const value = el.value || "";
+    const insertAt = below ? line.end : line.start;
+    const insertion = below
+      ? (insertAt < value.length ? "\n" : "\n")
+      : "\n";
+    el.setRangeText(insertion, insertAt, insertAt, "end");
+    emitInput(el, "insertLineBreak", "\n");
+    setCaret(el, below ? insertAt + 1 : insertAt);
+    setTextMode("insert", el);
+    return true;
+  }
+
+  function executeTextOperator(el, op, motion) {
+    const pos = caretPos(el);
+    const linewise = motion === op; // dd, cc, yy
+    let range;
+
+    if (linewise) {
+      range = currentLineRange(el, pos, true);
+    } else {
+      range = rangeForMotion(el, motion, pos);
+    }
+    if (!range) return false;
+
+    if (op === "d") deleteRange(el, range.start, range.end, linewise);
+    else if (op === "c") {
+      if (linewise) {
+        // cc changes the line contents but preserves its newline.
+        const contentRange = currentLineRange(el, pos, false);
+        changeRange(el, contentRange.start, contentRange.end);
+      } else {
+        changeRange(el, range.start, range.end);
+      }
+    } else if (op === "y") {
+      yankRange(el, range.start, range.end, linewise);
+      setCaret(el, pos);
+    }
+
+    clearTextOperator();
+    return true;
+  }
+
+  function handleTextEditorKey(event) {
+    const el = activePageTextEntry();
+    if (!el) return false;
+
+    // INSERT is native editing plus Escape into local Vim NORMAL.
+    if (state.textMode === "insert") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setTextMode("normal", el);
+        if (isPlainTextControl(el)) {
+          const pos = el.selectionEnd ?? 0;
+          setCaret(el, Math.max(0, pos - (pos > 0 ? 1 : 0)));
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // Contenteditable/select-style controls keep modal entry/exit but do not emulate
+    // string-range operations that require selectionStart/selectionEnd.
+    if (!isPlainTextControl(el)) {
+      if (state.textMode === "normal") {
+        if (event.key === "Escape") {
+          event.preventDefault(); event.stopPropagation();
+          resetTextMode(el); el.blur(); return true;
+        }
+        if (event.key.toLowerCase() === "i") {
+          event.preventDefault(); event.stopPropagation();
+          setTextMode("insert", el); return true;
+        }
+        if (event.key.toLowerCase() === "v") {
+          event.preventDefault(); event.stopPropagation();
+          setTextMode("visual", el); return true;
+        }
+      } else if (state.textMode === "visual" && event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        setTextMode("normal", el); return true;
+      }
+      return true;
+    }
+
+    const key = event.key;
+    const lower = key.toLowerCase();
+    const value = el.value || "";
+    let pos = caretPos(el);
+
+    if (state.textMode === "normal") {
+      if (key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        clearTextOperator();
+        resetTextMode(el);
+        el.blur();
+        return true;
+      }
+
+      // r{char}
+      if (state.textPendingReplace) {
+        event.preventDefault(); event.stopPropagation();
+        clearTextOperator();
+        if (!event.ctrlKey && !event.altKey && !event.metaKey && key.length === 1 && pos < value.length) {
+          el.setRangeText(key, pos, pos + 1, "end");
+          emitInput(el, "insertReplacementText", key);
+          setCaret(el, pos);
+        }
+        return true;
+      }
+
+      // Operator + motion: dd/dw/d$/d0/db/de, cc/cw/c$/c0/cb/ce,
+      // yy/yw/y$/y0/yb/ye.
+      if (state.textOperator) {
+        event.preventDefault(); event.stopPropagation();
+        const op = state.textOperator;
+        if ((key === op) || ["w", "e", "b", "0", "$"].includes(key)) {
+          executeTextOperator(el, op, key);
+        } else {
+          clearTextOperator();
+        }
+        return true;
+      }
+
+      if (["d", "c", "y"].includes(lower) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        event.preventDefault(); event.stopPropagation();
+        armTextOperator(lower);
+        return true;
+      }
+
+      if (lower === "i") {
+        event.preventDefault(); event.stopPropagation();
+        setTextMode("insert", el); return true;
+      }
+      if (lower === "a" && key !== "A") {
+        event.preventDefault(); event.stopPropagation();
+        setCaret(el, pos + 1); setTextMode("insert", el); return true;
+      }
+      if (key === "A") {
+        event.preventDefault(); event.stopPropagation();
+        setCaret(el, currentLineRange(el, pos, false).end);
+        setTextMode("insert", el); return true;
+      }
+      if (key === "I") {
+        event.preventDefault(); event.stopPropagation();
+        setCaret(el, currentLineRange(el, pos, false).start);
+        setTextMode("insert", el); return true;
+      }
+      if (lower === "v") {
+        event.preventDefault(); event.stopPropagation();
+        setTextMode("visual", el); return true;
+      }
+
+      if (["h","l","0","$","w","b","e"].includes(lower) || key === "$") {
+        event.preventDefault(); event.stopPropagation();
+        if (lower === "h") setCaret(el, pos - 1);
+        else if (lower === "l") setCaret(el, pos + 1);
+        else if (key === "0") setCaret(el, currentLineRange(el, pos, false).start);
+        else if (key === "$") setCaret(el, currentLineRange(el, pos, false).end);
+        else if (lower === "w") setCaret(el, wordForwardIndex(value, pos));
+        else if (lower === "b") setCaret(el, wordBackwardIndex(value, pos));
+        else if (lower === "e") setCaret(el, wordEndIndex(value, pos));
+        return true;
+      }
+
+      if (key === "D") {
+        event.preventDefault(); event.stopPropagation();
+        const r = rangeForMotion(el, "$", pos);
+        deleteRange(el, r.start, r.end); return true;
+      }
+      if (key === "C") {
+        event.preventDefault(); event.stopPropagation();
+        const r = rangeForMotion(el, "$", pos);
+        changeRange(el, r.start, r.end); return true;
+      }
+      if (lower === "x") {
+        event.preventDefault(); event.stopPropagation();
+        if (pos < value.length) deleteRange(el, pos, pos + 1);
+        return true;
+      }
+      if (key === "X") {
+        event.preventDefault(); event.stopPropagation();
+        if (pos > 0) deleteRange(el, pos - 1, pos);
+        return true;
+      }
+      if (lower === "s") {
+        event.preventDefault(); event.stopPropagation();
+        if (pos < value.length) deleteRange(el, pos, pos + 1);
+        setTextMode("insert", el); return true;
+      }
+      if (lower === "r") {
+        event.preventDefault(); event.stopPropagation();
+        armTextReplace(); return true;
+      }
+      if (lower === "p") {
+        event.preventDefault(); event.stopPropagation();
+        pasteRegister(el, key === "p"); return true;
+      }
+      if (key === "o" && insertTextareaLine(el, true)) {
+        event.preventDefault(); event.stopPropagation(); return true;
+      }
+      if (key === "O" && insertTextareaLine(el, false)) {
+        event.preventDefault(); event.stopPropagation(); return true;
+      }
+
+      if (!event.ctrlKey && !event.altKey && !event.metaKey && key.length === 1) {
+        event.preventDefault(); event.stopPropagation();
+        return true;
+      }
+      return false;
+    }
+
+    if (state.textMode === "visual") {
+      if (key === "Escape") {
+        event.preventDefault(); event.stopPropagation();
+        const collapse = el.selectionStart ?? pos;
+        setCaret(el, collapse);
+        setTextMode("normal", el); return true;
+      }
+
+      if (["h","l","0","$","w","b","e"].includes(lower) || key === "$") {
+        event.preventDefault(); event.stopPropagation();
+        let target = pos;
+        if (lower === "h") target = pos - 1;
+        else if (lower === "l") target = pos + 1;
+        else if (key === "0") target = currentLineRange(el, pos, false).start;
+        else if (key === "$") target = currentLineRange(el, pos, false).end;
+        else if (lower === "w") target = wordForwardIndex(value, pos);
+        else if (lower === "b") target = wordBackwardIndex(value, pos);
+        else if (lower === "e") target = wordEndIndex(value, pos);
+        setCaret(el, target, true);
+        return true;
+      }
+
+      const start = el.selectionStart ?? 0;
+      const finish = el.selectionEnd ?? start;
+
+      if (lower === "d" || lower === "x") {
+        event.preventDefault(); event.stopPropagation();
+        if (finish > start) deleteRange(el, start, finish);
+        setTextMode("normal", el); return true;
+      }
+      if (lower === "c") {
+        event.preventDefault(); event.stopPropagation();
+        if (finish > start) changeRange(el, start, finish);
+        else setTextMode("insert", el);
+        return true;
+      }
+      if (lower === "y") {
+        event.preventDefault(); event.stopPropagation();
+        if (finish > start) yankRange(el, start, finish);
+        setCaret(el, start);
+        setTextMode("normal", el); return true;
+      }
+      if (lower === "i") {
+        event.preventDefault(); event.stopPropagation();
+        setTextMode("insert", el); return true;
+      }
+
+      if (!event.ctrlKey && !event.altKey && !event.metaKey && key.length === 1) {
+        event.preventDefault(); event.stopPropagation();
+        return true;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  function pageTextEntryIsActive(event) {
+    const path = event?.composedPath?.() || [];
+    const target = path[0] instanceof Element ? path[0] : document.activeElement;
+    if (state.input && target === state.input) return false;
+    if (state.shadow && target && state.shadow.contains?.(target)) return false;
+
+    const active = document.activeElement;
+    return isPageTextEntry(target) || isPageTextEntry(active);
+  }
+
+  function visibleTextEntries() {
+    const selector = [
+      "input:not([type='hidden'])",
+      "textarea",
+      "select",
+      "[contenteditable='true']",
+      "[role='textbox']",
+    ].join(",");
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((el) => isPageTextEntry(el) && isVisibleInteractive(el))
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+        return ar.left - br.left;
+      });
+  }
+
+  function renderedTextEntries() {
+    const selector = [
+      "input:not([type='hidden'])",
+      "textarea",
+      "select",
+      "[contenteditable='true']",
+      "[role='textbox']",
+    ].join(",");
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((el) => {
+        if (!isPageTextEntry(el)) return false;
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        const ay = ar.top + scrollY;
+        const by = br.top + scrollY;
+        if (Math.abs(ay - by) > 8) return ay - by;
+        return (ar.left + scrollX) - (br.left + scrollX);
+      });
+  }
+
+  function focusNormalTextEntry() {
+    const visible = visibleTextEntries();
+    const pool = visible.length ? visible : renderedTextEntries();
+    if (!pool.length) return;
+
+    const el = pool[0];
+    if (!visible.length) {
+      try { el.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" }); }
+      catch (_) { el.scrollIntoView(); }
+    }
+
+    try { el.focus({ preventScroll: visible.length > 0 }); }
+    catch (_) { el.focus(); }
+
+    // Put the caret at the end for ordinary text controls, matching browser/Vimium
+    // expectations while leaving selects and contenteditable behavior native.
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      try {
+        const end = el.value?.length ?? 0;
+        el.setSelectionRange(end, end);
+      } catch (_) {}
+    }
+  }
+
+  function clearNormalSequence() {
+    clearTimeout(state.normalSequenceTimer);
+    state.normalSequenceTimer = null;
+    state.normalSequence = "";
+  }
+
+  function armNormalSequence(prefix) {
+    clearNormalSequence();
+    state.normalSequence = prefix;
+    state.normalSequenceTimer = setTimeout(clearNormalSequence, NORMAL_SEQUENCE_TIMEOUT_MS);
+  }
+
+  const normalScrollFrames = new WeakMap();
+  let normalWindowScrollFrame = null;
+  const NORMAL_SCROLL_DURATION_MS = 150;
+
+  function cancelNormalScrollAnimation(target) {
+    if (target === window) {
+      if (normalWindowScrollFrame != null) cancelAnimationFrame(normalWindowScrollFrame);
+      normalWindowScrollFrame = null;
+      return;
+    }
+    const frame = normalScrollFrames.get(target);
+    if (frame != null) cancelAnimationFrame(frame);
+    normalScrollFrames.delete(target);
+  }
+
+  function animateNormalScroll(target, dx, dy) {
+    cancelNormalScrollAnimation(target);
+
+    const startX = target === window ? window.scrollX : target.scrollLeft;
+    const startY = target === window ? window.scrollY : target.scrollTop;
+    const started = performance.now();
+
+    const tick = (now) => {
+      const t = Math.min(1, (now - started) / NORMAL_SCROLL_DURATION_MS);
+      const eased = t * t * (3 - 2 * t);
+      const x = startX + dx * eased;
+      const y = startY + dy * eased;
+
+      if (target === window) {
+        window.scrollTo(x, y);
+      } else {
+        target.scrollLeft = x;
+        target.scrollTop = y;
+      }
+
+      if (t < 1) {
+        const id = requestAnimationFrame(tick);
+        if (target === window) normalWindowScrollFrame = id;
+        else normalScrollFrames.set(target, id);
+      } else {
+        if (target === window) normalWindowScrollFrame = null;
+        else normalScrollFrames.delete(target);
+      }
+    };
+
+    const id = requestAnimationFrame(tick);
+    if (target === window) normalWindowScrollFrame = id;
+    else normalScrollFrames.set(target, id);
+  }
+
+  function canWindowScrollDirection(key) {
+    const doc = document.scrollingElement || document.documentElement;
+    if (key === "j") return doc.scrollTop + doc.clientHeight < doc.scrollHeight - 1;
+    if (key === "k") return doc.scrollTop > 0;
+    if (key === "l") return doc.scrollLeft + doc.clientWidth < doc.scrollWidth - 1;
+    if (key === "h") return doc.scrollLeft > 0;
+    return false;
+  }
+
+  function elementCanScrollDirection(el, key) {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = getComputedStyle(el);
+    const vertical = key === "j" || key === "k";
+    const overflow = vertical ? style.overflowY : style.overflowX;
+    if (!/(auto|scroll|overlay)/.test(overflow)) return false;
+
+    if (key === "j") return el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+    if (key === "k") return el.scrollTop > 0;
+    if (key === "l") return el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
+    if (key === "h") return el.scrollLeft > 0;
+    return false;
+  }
+
+  function visibleArea(rect) {
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(innerWidth, rect.right);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    return Math.max(0, right - left) * Math.max(0, bottom - top);
+  }
+
+  function deepestScrollableForDirection(key) {
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const el of document.querySelectorAll("body *")) {
+      if (!elementCanScrollDirection(el, key)) continue;
+      const rect = el.getBoundingClientRect();
+      const area = visibleArea(rect);
+      if (area <= 0) continue;
+
+      let depth = 0;
+      for (let p = el.parentElement; p; p = p.parentElement) depth++;
+
+      // Prefer substantial visible containers; depth breaks ties in favor of nested
+      // application panes/sidebars when top-level scrolling is unavailable.
+      const score = area + depth * 1000;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    return best;
+  }
+
+  function normalScrollTarget(key) {
+    if (canWindowScrollDirection(key)) return window;
+    return deepestScrollableForDirection(key) || window;
+  }
+
+  function pageTextEntryIsActive(event) {
+    const path = event?.composedPath?.() || [];
+    const target = path[0] instanceof Element ? path[0] : document.activeElement;
+    if (state.input && target === state.input) return false;
+    if (state.shadow && target && state.shadow.contains?.(target)) return false;
+
+    const active = document.activeElement;
+    return isPageTextEntry(target) || isPageTextEntry(active);
+  }
+
+  function visibleTextEntries() {
+    const selector = [
+      "input:not([type='hidden'])",
+      "textarea",
+      "select",
+      "[contenteditable='true']",
+      "[role='textbox']",
+    ].join(",");
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((el) => isPageTextEntry(el) && isVisibleInteractive(el))
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+        return ar.left - br.left;
+      });
+  }
+
+  function renderedTextEntries() {
+    const selector = [
+      "input:not([type='hidden'])",
+      "textarea",
+      "select",
+      "[contenteditable='true']",
+      "[role='textbox']",
+    ].join(",");
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((el) => {
+        if (!isPageTextEntry(el)) return false;
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        const ay = ar.top + scrollY;
+        const by = br.top + scrollY;
+        if (Math.abs(ay - by) > 8) return ay - by;
+        return (ar.left + scrollX) - (br.left + scrollX);
+      });
+  }
+
+  function focusNormalTextEntry() {
+    const visible = visibleTextEntries();
+    const pool = visible.length ? visible : renderedTextEntries();
+    if (!pool.length) return;
+
+    const el = pool[0];
+    if (!visible.length) {
+      try { el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" }); }
+      catch (_) { el.scrollIntoView(); }
+    }
+
+    try { el.focus({ preventScroll: visible.length > 0 }); }
+    catch (_) { el.focus(); }
+
+    // Put the caret at the end for ordinary text controls, matching browser/Vimium
+    // expectations while leaving selects and contenteditable behavior native.
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      try {
+        const end = el.value?.length ?? 0;
+        el.setSelectionRange(end, end);
+      } catch (_) {}
+    }
+  }
+
+  function clearNormalSequence() {
+    clearTimeout(state.normalSequenceTimer);
+    state.normalSequenceTimer = null;
+    state.normalSequence = "";
+  }
+
+  function armNormalSequence(prefix) {
+    clearNormalSequence();
+    state.normalSequence = prefix;
+    state.normalSequenceTimer = setTimeout(clearNormalSequence, NORMAL_SEQUENCE_TIMEOUT_MS);
+  }
+
+  function normalScrollByKey(key) {
+    const target = normalScrollTarget(key);
+    const dx = key === "h" ? -SCROLL_STEP : key === "l" ? SCROLL_STEP : 0;
+    const dy = key === "k" ? -SCROLL_STEP : key === "j" ? SCROLL_STEP : 0;
+    animateNormalScroll(target, dx, dy);
+  }
+
+
+  function sendBrowserAction(action) {
+    chrome.runtime.sendMessage({ type: "FUZZY_LINKS_BROWSER_ACTION", action });
+  }
+
+  function handleNormalModeKey(event) {
+    if (state.open || state.hintMode) return false;
+    if (event.ctrlKey || event.altKey || event.metaKey) return false;
+
+    const key = event.key.toLowerCase();
+
+    if (state.normalSequence === "g") {
+      if (key === "g") {
+        event.preventDefault();
+        event.stopPropagation();
+        clearNormalSequence();
+        animateNormalScroll(window, 0, -window.scrollY);
+        return true;
+      }
+      if (key === "i") {
+        event.preventDefault();
+        event.stopPropagation();
+        clearNormalSequence();
+        focusNormalTextEntry();
+        return true;
+      }
+      if (key === "0") {
+        event.preventDefault();
+        event.stopPropagation();
+        clearNormalSequence();
+        sendBrowserAction("first_tab");
+        return true;
+      }
+      if (event.key === "$") {
+        event.preventDefault();
+        event.stopPropagation();
+        clearNormalSequence();
+        sendBrowserAction("last_tab");
+        return true;
+      }
+      clearNormalSequence();
+    }
+
+    if (state.normalSequence === "y") {
+      if (key === "t") {
+        event.preventDefault();
+        event.stopPropagation();
+        clearNormalSequence();
+        sendBrowserAction("duplicate_tab");
+        return true;
+      }
+      clearNormalSequence();
+    }
+
+    if (key === "g" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      armNormalSequence("g");
+      return true;
+    }
+
+    if (key === "y" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      armNormalSequence("y");
+      return true;
+    }
+
+    if (event.key === "G") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      animateNormalScroll(
+        window,
+        0,
+        (document.scrollingElement || document.documentElement).scrollHeight - window.scrollY
+      );
+      return true;
+    }
+
+    if (key === "t" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      sendBrowserAction("new_tab");
+      return true;
+    }
+
+    if (event.key === "J") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      sendBrowserAction("tab_left");
+      return true;
+    }
+
+    if (event.key === "K") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      sendBrowserAction("tab_right");
+      return true;
+    }
+
+    if (key === "x" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      sendBrowserAction("close_tab");
+      return true;
+    }
+
+    if (event.key === "X") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      sendBrowserAction("restore_tab");
+      return true;
+    }
+
+    if (["h", "j", "k", "l"].includes(key)) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      normalScrollByKey(key);
+      return true;
+    }
+
+    if (key === "d" || key === "u") {
+      event.preventDefault();
+      event.stopPropagation();
+      clearNormalSequence();
+      const scrollKey = key === "d" ? "j" : "k";
+      const target = normalScrollTarget(scrollKey);
+      const viewport = target === window ? innerHeight : target.clientHeight;
+      animateNormalScroll(
+        target,
+        0,
+        (key === "d" ? 1 : -1) * Math.max(120, viewport * 0.5)
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+
+  function hintCodeForIndex(index) {
+    const alphabet = "asdfghjklqwertyuiopzxcvbnm";
+    const base = alphabet.length;
+    if (index < base) return alphabet[index];
+    const first = Math.floor(index / base) - 1;
+    const second = index % base;
+    return first < base ? alphabet[first] + alphabet[second] : null;
+  }
+
+  function clearHintMode() {
+    state.hintMode = false;
+    state.hintBuffer = "";
+    state.hintItems = [];
+    state.hintHost?.remove();
+    state.hintHost = null;
+    state.hintShadow = null;
+  }
+
+  function renderHintMode() {
+    if (!state.hintHost?.isConnected) {
+      const host = document.createElement("div");
+      host.style.cssText = "position:fixed;inset:0;z-index:2147483646;pointer-events:none";
+      const shadow = host.attachShadow({mode:"open"});
+      shadow.innerHTML = `<style>
+        .h{position:fixed;min-width:16px;padding:2px 4px;border:1px solid #8a5a00;border-radius:4px;
+        background:#ffd966;color:#111;box-shadow:0 1px 4px #0006;font:700 11px/1.15 monospace;
+        text-align:center}.dim{opacity:.22}.match{background:#ffb300}
+      </style><div id="layer"></div>`;
+      document.documentElement.appendChild(host);
+      state.hintHost=host; state.hintShadow=shadow;
+    }
+    const layer=state.hintShadow.getElementById("layer");
+    layer.replaceChildren();
+    for(const item of state.hintItems){
+      if(!item.el?.isConnected) continue;
+      const r=item.el.getBoundingClientRect();
+      if(r.width<=0||r.height<=0) continue;
+      const b=document.createElement("div");
+      b.className="h";
+      if(state.hintBuffer) b.classList.add(item.code.startsWith(state.hintBuffer)?"match":"dim");
+      b.textContent=item.code;
+      b.style.left=`${Math.max(0,Math.min(innerWidth-30,r.left+2))}px`;
+      b.style.top=`${Math.max(0,Math.min(innerHeight-18,r.top+2))}px`;
+      layer.appendChild(b);
+    }
+  }
+
+  function enterHintMode() {
+    if(state.open || pageTextEntryIsActive()) return;
+    const candidates=collectVisibleCandidates();
+    state.hintItems=[];
+    for(let i=0;i<candidates.length;i++){
+      const code=hintCodeForIndex(i);
+      if(!code) break;
+      state.hintItems.push({...candidates[i],code});
+    }
+    if(!state.hintItems.length) return;
+    state.hintMode=true; state.hintBuffer="";
+    renderHintMode();
+  }
+
+  function activateHintItem(item) {
+    const el=item?.el;
+    if(!el?.isConnected){clearHintMode();return;}
+    clearHintMode();
+    if(isPageTextEntry(el)){
+      try{el.focus({preventScroll:false});}catch(_){el.focus();}
+      setTextMode("insert",el);
+      return;
+    }
+    try{el.click();}catch(_){if(item.url) location.assign(item.url);}
+  }
+
+  function handleHintModeKey(event) {
+    if(!state.hintMode) return false;
+    if(event.key==="Escape"){event.preventDefault();event.stopPropagation();clearHintMode();return true;}
+    if(event.key==="Backspace"){
+      event.preventDefault();event.stopPropagation();
+      state.hintBuffer=state.hintBuffer.slice(0,-1);renderHintMode();return true;
+    }
+    event.preventDefault();event.stopPropagation();
+    if(event.ctrlKey||event.altKey||event.metaKey||event.key.length!==1) return true;
+    const key=event.key.toLowerCase();
+    if(!"asdfghjklqwertyuiopzxcvbnm".includes(key)) return true;
+    state.hintBuffer+=key;
+    const matches=state.hintItems.filter(i=>i.code.startsWith(state.hintBuffer));
+    const exact=matches.find(i=>i.code===state.hintBuffer);
+    if(exact){activateHintItem(exact);return true;}
+    if(!matches.length||state.hintBuffer.length>=2) state.hintBuffer="";
+    renderHintMode(); return true;
+  }
+
+  function handleDoubleShift(event) {
+    if(event.key!=="Shift"||event.repeat||state.open||state.hintMode||pageTextEntryIsActive(event)) return false;
+    const now=performance.now();
+    if(now-state.lastShiftDownAt<=350){
+      state.lastShiftDownAt=0; event.preventDefault();event.stopPropagation();enterHintMode();return true;
+    }
+    state.lastShiftDownAt=now; return false;
   }
 
   function candidateSignature(candidate) {
@@ -850,8 +1983,8 @@
   }
 
   function performScroll(target, options) {
-    if (target === window) window.scrollBy({ ...options, behavior: "instant" });
-    else target.scrollBy({ ...options, behavior: "instant" });
+    if (target === window) window.scrollBy({ ...options, behavior: "smooth" });
+    else target.scrollBy({ ...options, behavior: "smooth" });
 
     // Local scroll containers do not reliably trigger the window scroll handler.
     // Refresh explicitly after layout settles so newly visible controls join NAV.
@@ -1087,9 +2220,32 @@
     }
   }
 
-  window.addEventListener("pagehide", () => saveSessionState());
+  document.addEventListener("focusin", (event) => {
+    const el = event.target;
+    if (state.input && el === state.input) return;
+    if (isPageTextEntry(el)) setTextMode("insert", el);
+  }, true);
+
+  document.addEventListener("focusout", (event) => {
+    const el = event.target;
+    if (isPageTextEntry(el)) resetTextMode(el);
+  }, true);
+
+  window.addEventListener("pagehide", () => { clearHintMode(); saveSessionState(); });
 
   document.addEventListener("keydown", (event) => {
+    if (handleHintModeKey(event)) return;
+    if (handleDoubleShift(event)) return;
+
+    // Page text controls have their own local Vim editor state. Fuzzy session
+    // activation and page NORMAL shortcuts remain disabled while a field is active.
+    if (pageTextEntryIsActive(event)) {
+      handleTextEditorKey(event);
+      return;
+    }
+
+    if (!state.open && handleNormalModeKey(event)) return;
+
     if (matchesActivationShortcut(event)) {
       event.preventDefault();
       event.stopPropagation();
